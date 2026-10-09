@@ -156,6 +156,31 @@ static int mister_fb_pan_display(struct fb_var_screeninfo *var,
 	return 0;
 }
 
+static int mister_fb_check_var(struct fb_var_screeninfo *var,
+			       struct fb_info *info)
+{
+	u32 activate = var->activate;
+	u32 yres_virtual = var->yres_virtual;
+	u32 yoffset = var->yoffset;
+
+	/* The module parameter owns the mode; user space cannot change it. */
+	*var = info->var;
+	var->activate = activate;
+
+	if (yres_virtual > info->var.yres * frames)
+		yres_virtual = info->var.yres * frames;
+	else if (yres_virtual < info->var.yres)
+		yres_virtual = info->var.yres;
+	var->yres_virtual = yres_virtual;
+
+	if (!var->yres || yoffset % var->yres || yoffset >= var->yres_virtual)
+		return -EINVAL;
+
+	var->yoffset = yoffset;
+
+	return 0;
+}
+
 static struct fb_ops ops = {
 	.owner = THIS_MODULE,
 	.fb_read = fb_sys_read,
@@ -163,6 +188,7 @@ static struct fb_ops ops = {
 	.fb_fillrect = sys_fillrect,
 	.fb_copyarea = sys_copyarea,
 	.fb_imageblit = sys_imageblit,
+	.fb_check_var = mister_fb_check_var,
 	.fb_setcolreg = fb_setcolreg,
 	.fb_ioctl = fb_ioctl,
 	.fb_pan_display = mister_fb_pan_display,
@@ -220,6 +246,9 @@ static int setup_fb_info(struct fb_dev *fbdev)
 
 	info->var.xres_virtual = info->var.xres,
 	info->var.yres_virtual = info->var.yres * frames;
+
+	info->var.xoffset = 0;
+	info->var.yoffset = 0;
 
 	info->fix.xpanstep = 0;
 	info->fix.ypanstep = info->var.yres_virtual > info->var.yres ?
