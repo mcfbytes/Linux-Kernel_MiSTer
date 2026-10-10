@@ -16,6 +16,7 @@
 #include <linux/fb.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/interrupt.h>
@@ -36,6 +37,9 @@ module_param(format, uint, 0444);
 module_param(rb,     uint, 0444);
 module_param(frame_count, uint, 0444);
 module_param(res_count, uint, 0444);
+
+static u32 frames = 1;
+module_param(frames, uint, 0444);
 
 struct fb_dev {
 	struct platform_device *pdev;
@@ -131,6 +135,52 @@ static int fb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long arg)
 	return ret;
 }
 
+static int mister_fb_pan_display(struct fb_var_screeninfo *var,
+				 struct fb_info *info)
+{
+	u32 yres = info->var.yres;
+
+	if (!yres || var->yoffset % yres)
+		return -EINVAL;
+
+	if (var->yoffset >= info->var.yres_virtual)
+		return -EINVAL;
+
+	/*
+	 * Record only: the scaler scans out whichever frame its base register
+	 * points at, and the userspace firmware moves that base over its own
+	 * link, so no hardware access happens here.
+	 */
+	info->var.yoffset = var->yoffset;
+
+	return 0;
+}
+
+static int mister_fb_check_var(struct fb_var_screeninfo *var,
+			       struct fb_info *info)
+{
+	u32 activate = var->activate;
+	u32 yres_virtual = var->yres_virtual;
+	u32 yoffset = var->yoffset;
+
+	/* The module parameter owns the mode; user space cannot change it. */
+	*var = info->var;
+	var->activate = activate;
+
+	if (yres_virtual > info->var.yres * frames)
+		yres_virtual = info->var.yres * frames;
+	else if (yres_virtual < info->var.yres)
+		yres_virtual = info->var.yres;
+	var->yres_virtual = yres_virtual;
+
+	if (!var->yres || yoffset % var->yres || yoffset >= var->yres_virtual)
+		return -EINVAL;
+
+	var->yoffset = yoffset;
+
+	return 0;
+}
+
 static struct fb_ops ops = {
 	.owner = THIS_MODULE,
 	.fb_read = fb_sys_read,
@@ -138,10 +188,36 @@ static struct fb_ops ops = {
 	.fb_fillrect = sys_fillrect,
 	.fb_copyarea = sys_copyarea,
 	.fb_imageblit = sys_imageblit,
+	.fb_check_var = mister_fb_check_var,
 	.fb_setcolreg = fb_setcolreg,
 	.fb_ioctl = fb_ioctl,
+	.fb_pan_display = mister_fb_pan_display,
 	.fb_mmap = fb_io_mmap,
 };
+
+static void clamp_frames(struct fb_dev *fbdev)
+{
+	u64 frame_size = (u64)fbdev->info.fix.line_length * fbdev->info.var.yres;
+	u64 avail = resource_size(fbdev->fb_res);
+	u32 max_frames;
+
+	if (!frames)
+		frames = 1;
+
+	if (avail <= 4096 || !frame_size)
+		return;
+
+	max_frames = (u32)div64_u64(avail - 4096, frame_size);
+	if (!max_frames)
+		max_frames = 1;
+
+	if (frames > max_frames) {
+		dev_warn(&fbdev->pdev->dev,
+			 "requested %u frames, using %u to fit the region\n",
+			 frames, max_frames);
+		frames = max_frames;
+	}
+}
 
 static int setup_fb_info(struct fb_dev *fbdev)
 {
@@ -155,6 +231,8 @@ static int setup_fb_info(struct fb_dev *fbdev)
 	info->var.yres = height;
 	info->fix.line_length = stride;
 
+	clamp_frames(fbdev);
+
 	strcpy(info->fix.id, DRIVER_NAME);
 	info->fix.type = FB_TYPE_PACKED_PIXELS;
 	info->fix.visual = (format == 8) ? FB_VISUAL_PSEUDOCOLOR : FB_VISUAL_TRUECOLOR;
@@ -167,7 +245,14 @@ static int setup_fb_info(struct fb_dev *fbdev)
 	info->var.vmode = FB_VMODE_NONINTERLACED;
 
 	info->var.xres_virtual = info->var.xres,
-	info->var.yres_virtual = info->var.yres;
+	info->var.yres_virtual = info->var.yres * frames;
+
+	info->var.xoffset = 0;
+	info->var.yoffset = 0;
+
+	info->fix.xpanstep = 0;
+	info->fix.ypanstep = info->var.yres_virtual > info->var.yres ?
+			     info->var.yres : 0;
 
 	info->var.red.msb_right = 0;
 	info->var.green.msb_right = 0;
@@ -236,7 +321,7 @@ static int setup_fb_info(struct fb_dev *fbdev)
 
 	dev_info(&fbdev->pdev->dev, "width = %u, height = %u, format=%u\n", info->var.xres, info->var.yres, format);
 
-	info->fix.smem_len = info->fix.line_length * info->var.yres;
+	info->fix.smem_len = info->fix.line_length * info->var.yres_virtual;
 
 	info->pseudo_palette = fbdev->fb_base;
 	/* MiSTer: FBINFO_FLAG_DEFAULT was removed upstream (it was always 0); 0 is equivalent. */
@@ -349,7 +434,9 @@ static int mode_set(const char *val, const struct kernel_param *kp)
 
 		memset(p_fbdev->fb_base, 0, resource_size(p_fbdev->fb_res));
 
-		sscanf(val, "%u %u %u %u %u", &format, &rb, &width, &height, &stride);
+		frames = 1;
+		sscanf(val, "%u %u %u %u %u %u",
+		       &format, &rb, &width, &height, &stride, &frames);
 		setup_fb_info(p_fbdev);
 
 		fb_set(&p_fbdev->info);
@@ -365,6 +452,10 @@ static int mode_get(char *val, const struct kernel_param *kp)
 {
 	if(p_fbdev)
 	{
+		if (frames != 1)
+			return sprintf(val, "%u %u %u %u %u %u",
+				       format, rb, width, height, stride, frames);
+
 		sprintf(val, "%u %u %u %u %u", format, rb, width, height, stride);
 		return strlen(val);
 	}
